@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>タクシー呼び出し</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "Helvetica Neue", Arial, sans-serif;
+      background: #f5f5f5;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+
+    header {
+      background: #1a73e8;
+      color: #fff;
+      padding: 12px 20px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      box-shadow: 0 2px 4px rgba(0,0,0,.25);
+      z-index: 10;
+    }
+
+    header h1 { font-size: 1.2rem; font-weight: 600; }
+
+    #map {
+      flex: 1;
+      width: 100%;
+    }
+
+    #panel {
+      background: #fff;
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      box-shadow: 0 -2px 6px rgba(0,0,0,.12);
+      z-index: 10;
+    }
+
+    #status {
+      font-size: 0.9rem;
+      color: #555;
+      min-height: 1.2em;
+    }
+
+    #callBtn {
+      background: #1a73e8;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 14px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    #callBtn:hover { background: #1558b0; }
+    #callBtn:disabled { background: #aaa; cursor: not-allowed; }
+
+    #legend {
+      display: flex;
+      gap: 16px;
+      font-size: 0.8rem;
+      color: #555;
+      align-items: center;
+    }
+
+    .legend-item { display: flex; align-items: center; gap: 4px; }
+
+    .dot {
+      width: 12px; height: 12px; border-radius: 50%;
+      display: inline-block;
+    }
+
+    .dot-taxi { background: #fbbc04; border: 2px solid #e8a000; }
+    .dot-user { background: #1a73e8; border: 2px solid #1558b0; }
+
+    #toast {
+      position: fixed;
+      bottom: 80px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,.8);
+      color: #fff;
+      padding: 10px 20px;
+      border-radius: 24px;
+      font-size: 0.9rem;
+      opacity: 0;
+      transition: opacity 0.3s;
+      pointer-events: none;
+      z-index: 100;
+      text-align: center;
+      max-width: 90vw;
+    }
+
+    #toast.show { opacity: 1; }
+  </style>
+</head>
+<body>
+  <header>
+    <span>🚕</span>
+    <h1>タクシー呼び出し</h1>
+  </header>
+
+  <div id="map"></div>
+
+  <div id="panel">
+    <div id="legend">
+      <div class="legend-item"><span class="dot dot-user"></span> 現在地</div>
+      <div class="legend-item"><span class="dot dot-taxi"></span> タクシー</div>
+    </div>
+    <div id="status">現在地を取得中…</div>
+    <button id="callBtn" disabled>🚕 タクシーを呼ぶ</button>
+  </div>
+
+  <div id="toast"></div>
+
+  <script>
+    // -----------------------------------------------------------------------
+    // State
+    // -----------------------------------------------------------------------
+    let map;
+    let userMarker = null;
+    let userPos = null;          // { lat, lng }
+    const taxiMarkers = {};      // id -> google.maps.Marker
+
+    // -----------------------------------------------------------------------
+    // UI helpers
+    // -----------------------------------------------------------------------
+    const statusEl = document.getElementById('status');
+    const callBtn  = document.getElementById('callBtn');
+    const toastEl  = document.getElementById('toast');
+
+    function setStatus(msg) { statusEl.textContent = msg; }
+
+    function showToast(msg, durationMs = 4000) {
+      toastEl.textContent = msg;
+      toastEl.classList.add('show');
+      setTimeout(() => toastEl.classList.remove('show'), durationMs);
+    }
+
+    // -----------------------------------------------------------------------
+    // Google Maps initialisation (called by the Maps script callback)
+    // -----------------------------------------------------------------------
+    window.initMap = async function () {
+      // Default centre while waiting for geolocation.
+      const defaultCenter = { lat: 35.6812, lng: 139.7671 }; // Tokyo Station
+
+      map = new google.maps.Map(document.getElementById('map'), {
+        center: defaultCenter,
+        zoom: 15,
+        mapTypeControl: false,
+        streetViewControl: false,
+        fullscreenControl: false,
+      });
+
+      // Start polling taxi positions right away.
+      await refreshTaxis();
+      setInterval(refreshTaxis, 5000);
+
+      // Ask for the user's current location.
+      locateUser();
+    };
+
+    // -----------------------------------------------------------------------
+    // Geolocation
+    // -----------------------------------------------------------------------
+    function locateUser() {
+      if (!navigator.geolocation) {
+        setStatus('お使いのブラウザは位置情報に対応していません。');
+        return;
+      }
+
+      navigator.geolocation.watchPosition(
+        (pos) => {
+          userPos = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+
+          if (!userMarker) {
+            userMarker = new google.maps.Marker({
+              position: userPos,
+              map,
+              title: '現在地',
+              icon: {
+                path: google.maps.SymbolPath.CIRCLE,
+                scale: 10,
+                fillColor: '#1a73e8',
+                fillOpacity: 1,
+                strokeColor: '#fff',
+                strokeWeight: 3,
+              },
+              zIndex: 10,
+            });
+            map.panTo(userPos);
+          } else {
+            userMarker.setPosition(userPos);
+          }
+
+          setStatus('現在地を取得しました。');
+          callBtn.disabled = false;
+        },
+        (err) => {
+          console.warn('Geolocation error:', err);
+          setStatus('位置情報を取得できませんでした: ' + err.message);
+        },
+        { enableHighAccuracy: true, maximumAge: 10000 }
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Taxi markers
+    // -----------------------------------------------------------------------
+    function buildTaxiIcon() {
+      if (!window.google) return undefined;
+      return {
+        url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(
+          `<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36">
+            <circle cx="18" cy="18" r="16" fill="#fbbc04" stroke="#e8a000" stroke-width="2"/>
+          </svg>`
+        ),
+        scaledSize: new google.maps.Size(36, 36),
+        anchor: new google.maps.Point(18, 18),
+      };
+    }
+
+    async function refreshTaxis() {
+      try {
+        const res  = await fetch('/api/taxis');
+        const list = await res.json();
+
+        const seen = new Set();
+
+        for (const taxi of list) {
+          seen.add(taxi.id);
+          const pos = { lat: taxi.lat, lng: taxi.lng };
+
+          if (taxiMarkers[taxi.id]) {
+            taxiMarkers[taxi.id].setPosition(pos);
+          } else {
+            taxiMarkers[taxi.id] = new google.maps.Marker({
+              position: pos,
+              map,
+              title: 'タクシー ' + taxi.id,
+              label: {
+                text: taxi.id,
+                color: '#fff',
+                fontWeight: 'bold',
+                fontSize: '11px',
+              },
+              icon: buildTaxiIcon(),
+              zIndex: 5,
+            });
+
+            // Info window on click.
+            const iw = new google.maps.InfoWindow({
+              content: `<b>タクシー ${taxi.id}</b>`,
+            });
+            taxiMarkers[taxi.id].addListener('click', () => {
+              iw.open({ anchor: taxiMarkers[taxi.id], map });
+            });
+          }
+        }
+
+        // Remove markers for taxis no longer in the fleet.
+        for (const id of Object.keys(taxiMarkers)) {
+          if (!seen.has(id)) {
+            taxiMarkers[id].setMap(null);
+            delete taxiMarkers[id];
+          }
+        }
+      } catch (e) {
+        console.error('Failed to fetch taxis:', e);
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // Call taxi
+    // -----------------------------------------------------------------------
+    callBtn.addEventListener('click', async () => {
+      if (!userPos) {
+        showToast('現在地が取得できていません。しばらくお待ちください。');
+        return;
+      }
+
+      callBtn.disabled = true;
+      setStatus('タクシーを手配中…');
+
+      try {
+        const res  = await fetch('/api/call', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(userPos),
+        });
+        const data = await res.json();
+        setStatus(data.message);
+        showToast(data.message, 5000);
+
+        // Highlight the dispatched taxi.
+        if (data.taxiId && taxiMarkers[data.taxiId]) {
+          map.panTo(taxiMarkers[data.taxiId].getPosition());
+          const iw = new google.maps.InfoWindow({
+            content: `<b>${data.message}</b>`,
+          });
+          iw.open({ anchor: taxiMarkers[data.taxiId], map });
+        }
+      } catch (e) {
+        console.error('Call failed:', e);
+        setStatus('タクシーの手配に失敗しました。');
+        showToast('エラーが発生しました。再度お試しください。');
+      } finally {
+        setTimeout(() => { callBtn.disabled = false; }, 5000);
+      }
+    });
+
+    // -----------------------------------------------------------------------
+    // Load Google Maps API dynamically (key fetched from backend)
+    // -----------------------------------------------------------------------
+    (async function loadMapsScript() {
+      try {
+        const res  = await fetch('/api/maps-key');
+        const data = await res.json();
+        const key  = data.key || '';
+
+        const script = document.createElement('script');
+        script.src = `https://maps.googleapis.com/maps/api/js?key=${key}&callback=initMap&language=ja`;
+        script.async = true;
+        script.defer = true;
+        script.onerror = () => {
+          setStatus('Google Maps の読み込みに失敗しました。API キーを確認してください。');
+        };
+        document.head.appendChild(script);
+      } catch (e) {
+        setStatus('サーバーへの接続に失敗しました。');
+      }
+    })();
+  </script>
+</body>
+</html>
